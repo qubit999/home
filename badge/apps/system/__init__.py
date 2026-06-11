@@ -58,19 +58,28 @@ config = {"tz_offset": DEFAULT_TZ_OFFSET}
 
 
 def load_config():
-    """Restore persisted settings. A missing file just leaves the defaults."""
+    """Restore persisted settings. A missing or corrupt file leaves defaults."""
     try:
         State.load("system", config)
-    except Exception:
+    except (OSError, ValueError):
         pass
+    # The state file lives on a user-visible filesystem - never trust the
+    # loaded value, or a bad edit crashes the app at every boot.
+    try:
+        config["tz_offset"] = max(TZ_MIN, min(TZ_MAX, int(config["tz_offset"])))
+    except (TypeError, ValueError):
+        config["tz_offset"] = DEFAULT_TZ_OFFSET
 
 
 def save_config():
     """Persist settings so the timezone survives a reboot."""
+    global hw_status
     try:
-        State.save("system", config)
-    except Exception:
-        pass
+        ok = State.save("system", config)
+    except (OSError, ValueError):
+        ok = False
+    if ok is False:  # State.save reports failure as False, not an exception
+        hw_status = "save err"
 
 
 def tz_label():
@@ -88,6 +97,10 @@ wlan = None
 _hw_rtc = None
 time_valid = False    # do we have a real time to display?
 ntp_synced = False    # has an NTP sync completed at least once?
+ntp_fail_at = None    # io.ticks of the last failed NTP attempt
+NTP_RETRY_MS = 30000  # wait between failed NTP attempts (the call blocks)
+connect_at = 0        # io.ticks of the last wlan.connect() attempt
+WIFI_RETRY_MS = 30000  # re-issue connect() if no IP after this long
 source = "--"         # where the shown time came from: "RTC" or "NTP"
 status = "Starting..."   # short network/sync status line
 hw_status = ""        # hardware RTC write result: "RTC set" / "RTC err"
@@ -98,13 +111,16 @@ def load_credentials():
     global WIFI_SSID, WIFI_PASSWORD
     if WIFI_SSID is not None:
         return True
+    sys.path.insert(0, "/")
     try:
-        sys.path.insert(0, "/")
         from secrets import WIFI_SSID as S, WIFI_PASSWORD as P
-        sys.path.pop(0)
         WIFI_SSID, WIFI_PASSWORD = S, P
-    except ImportError:
+    except Exception:
+        # ImportError when secrets.py is missing, but also e.g. SyntaxError
+        # from a botched edit - a bad credentials file must not crash the app.
         WIFI_SSID, WIFI_PASSWORD = None, None
+    finally:
+        sys.path.pop(0)
     return WIFI_SSID is not None
 
 
@@ -166,7 +182,7 @@ def have_ip():
 def tick_network():
     """Bring WiFi up and sync time over NTP (once). On success also writes the
     battery-backed hardware RTC. Non-blocking-ish."""
-    global wlan, ntp_synced, time_valid, source, status
+    global wlan, ntp_synced, time_valid, source, status, ntp_fail_at, connect_at
 
     if ntp_synced:
         return
@@ -184,14 +200,27 @@ def tick_network():
         wlan.active(True)
         if not have_ip():
             wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+            connect_at = io.ticks
         status = "Connecting..."
         return
 
     if not have_ip():
+        # Re-issue connect() if the first attempt stalled (e.g. AP was down
+        # at boot) - but only every WIFI_RETRY_MS; the CYW43 driver resets
+        # its handshake when connect() is spammed.
+        elapsed = io.ticks - connect_at
+        if not (0 <= elapsed < WIFI_RETRY_MS):  # negative => ticks wrapped
+            wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+            connect_at = io.ticks
         status = "Connecting..."
         return
 
-    # We have an IP - try a single NTP sync (brief blocking call).
+    # We have an IP - try an NTP sync. settime() blocks for up to a second,
+    # so after a failure back off instead of freezing the UI every frame.
+    if ntp_fail_at is not None:
+        elapsed = io.ticks - ntp_fail_at
+        if 0 <= elapsed < NTP_RETRY_MS:  # negative => ticks wrapped: retry now
+            return
     status = "Syncing time..."
     try:
         ntptime.settime()        # internal RTC <- UTC
@@ -202,13 +231,20 @@ def tick_network():
         status = "Synced"
     except Exception:
         status = "Sync failed"
+        ntp_fail_at = io.ticks
 
 
 def init():
     # Restore the saved timezone, then show the battery-backed time straight
     # away, before networking.
+    global time_valid, source, status
     load_config()
     restore_from_hw_rtc()
+    if machine is None:
+        # Desktop simulator: no RTC or NTP, but the host clock is correct.
+        time_valid = True
+        source = "SIM"
+        status = "Host clock"
 
 
 def center_text(text, y):
@@ -238,11 +274,13 @@ def draw_battery(x, y, level, charging):
 def update():
     tick_network()
 
-    # Manual re-sync with button A: re-runs NTP and re-writes the hardware RTC.
+    # Manual re-sync with button A: re-runs NTP (skipping any backoff) and
+    # re-writes the hardware RTC.
     if io.BUTTON_A in io.pressed:
-        global ntp_synced, hw_status
+        global ntp_synced, hw_status, ntp_fail_at
         ntp_synced = False
         hw_status = ""
+        ntp_fail_at = None
 
     # Adjust the timezone with UP / DOWN and save the change immediately.
     if io.BUTTON_UP in io.pressed and config["tz_offset"] < TZ_MAX:
@@ -286,9 +324,10 @@ def update():
         center_text(date_str, 48)
         # Time source + hardware-RTC status (verifiable on screen)
         if ntp_synced:
-            line = "via NTP - " + (hw_status or "RTC set")
+            line = "via %s - %s" % (source, hw_status or "RTC set")
         else:
-            line = "via RTC - " + status
+            # hw_status carries a config-save error here, if any
+            line = "via %s - %s" % (source, hw_status or status)
         center_text(line, 70)
 
     # Current timezone (the value the UP / DOWN buttons change).
@@ -320,4 +359,4 @@ def update():
 
 
 if __name__ == "__main__":
-    run(update)
+    run(update, init=init)
